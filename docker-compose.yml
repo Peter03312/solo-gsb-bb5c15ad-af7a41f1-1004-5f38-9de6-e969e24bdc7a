@@ -1,0 +1,16 @@
+services:
+  app:
+    build: .
+    container_name: stage-cue-manager
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      DB_PATH: /app/data/app.db
+      SEED_DEMO: "1"        # 置 "0" 关闭演示数据
+    volumes:
+      - cue-data:/app/data  # SQLite 数据持久化在本地卷
+    restart: unless-stopped
+
+volumes:
+  cue-data:

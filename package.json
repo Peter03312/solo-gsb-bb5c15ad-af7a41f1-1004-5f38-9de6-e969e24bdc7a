@@ -1,0 +1,14 @@
+{
+  "name": "stage-cue-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "舞台监督排演与现场执行系统（提示单编排 / 校验发布 / 现场执行）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
