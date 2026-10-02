@@ -424,7 +424,7 @@ async function renderPerformance(id) {
   } catch (e) { app.innerHTML = `<div class="error-list">${esc(e.message)}</div>`; }
 }
 
-function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests }) {
+function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests, faults, active_fault_count: activeFaultCount }) {
   // 2.5s 轮询整体重绘：记住当前焦点与光标位置，重绘后恢复，避免输入被打断
   const active = document.activeElement;
   const focusKey = active && (active.dataset.focusKey || (active.id === 'operator-input' ? 'operator' : null));
@@ -439,6 +439,11 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   const resolvedReqs = requests.filter(r => r.status !== 'pending');
   const readonly = !!(continuation && continuation.readonly);
   const carriedCount = events.filter(e => e.source === 'carried').length;
+  const faultList = faults || [];
+  const activeFaults = faultList.filter(f => f.status === 'active');
+  // 受故障影响（触发被冻结）的提示去重计数（含故障编号本身及其全部下游）
+  const blockedByFaultSet = new Set();
+  activeFaults.forEach(f => (f.affected_labels || []).forEach(l => blockedByFaultSet.add(l)));
 
   // 正在操作人框中输入时保留 DOM 中的实时值（下方 innerHTML 重绘前取出），避免光标跳尾
   const opFocused = focusKey === 'operator';
@@ -462,6 +467,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
         <span class="status skipped">已跳过 ${counts.skipped}</span>
         <span class="status blocked">受阻 ${counts.blocked}</span>
         ${pendingReqs.length ? `<span class="status review-pending">待复核 ${pendingReqs.length}</span>` : ''}
+        ${activeFaults.length ? `<span class="status fault-active">⚠ 故障 ${activeFaults.length} · 冻结 ${blockedByFaultSet.size}</span>` : ''}
         <span class="grow"></span>
         <label>操作人 <input id="operator-input" type="text" value="${esc(opVal)}" placeholder="姓名" style="width:110px" ${readonly ? 'disabled' : ''}></label>
         <a href="#/shows/${perf.show_id}">返回场次</a>
@@ -469,6 +475,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
     </div>
     ${renderContinuationBanner(perf, continuation, carriedCount)}
     ${readonly ? '' : '<div id="batch-panel-mount"></div>'}
+    <div id="fault-panel-mount"></div>
     ${readonly ? '' : '<div id="continue-panel-mount"></div>'}
     <div class="grid-2">
       <div id="cue-list">
@@ -485,17 +492,22 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
           ${readonly ? '<p class="muted">只读演出：申请记录可查，不能再处置。</p>' : ''}
           ${pendingReqs.length === 0 ? (readonly ? '' : '<p class="muted">暂无待复核申请</p>') : `
           <ul>
-            ${pendingReqs.map(r => `
+            ${pendingReqs.map(r => {
+              const reqCue = cues.find(c => c.label === r.label);
+              const reqFault = !!(reqCue && (reqCue.fault_blocked || []).length);
+              return `
               <li>
                 <span class="status review-pending">待复核</span>
-                <b>${esc(r.label)}</b><br>
+                <b>${esc(r.label)}</b>${reqFault ? '<span class="badge fault-badge">故障冻结</span>' : ''}<br>
                 <span class="muted">申请人 ${esc(r.requested_by)} · ${fmtTime(r.requested_at)}</span><br>
+                ${reqFault ? '<span class="fault-note-text">受未解除故障影响，申请保留但故障解除前不得确认</span><br>' : ''}
                 <span class="review-actions">
-                  <button class="small" data-req-act="confirm" data-req="${r.id}" ${readonly ? 'disabled' : ''}>确认触发</button>
+                  <button class="small" data-req-act="confirm" data-req="${r.id}" ${readonly || reqFault ? 'disabled' : ''}>确认触发</button>
                   <button class="danger small" data-req-act="reject" data-req="${r.id}" ${readonly ? 'disabled' : ''}>驳回</button>
                   <button class="ghost small" data-req-act="cancel" data-req="${r.id}" ${readonly ? 'disabled' : ''}>撤销</button>
                 </span>
-              </li>`).join('')}
+              </li>`;
+            }).join('')}
           </ul>`}
           ${resolvedReqs.length === 0 ? '' : `
           <b class="review-history-title">处置记录</b>
@@ -531,15 +543,21 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   const opInput = document.getElementById('operator-input');
   if (opInput) opInput.onchange = opInput.oninput = () => localStorage.setItem('operator', opInput.value.trim());
 
-  if (readonly) return;
+  // 只读演出仍展示故障影响范围与处理记录（只读形态，无登记 / 解除表单）
+  if (readonly) {
+    drawFaultPanel(id, cues, faultList, activeFaults, true);
+    return;
+  }
 
   cues.forEach(c => {
     const fireBtn = document.getElementById(`fire-${c.id}`);
     const skipBtn = document.getElementById(`skip-${c.id}`);
     const retractBtn = document.getElementById(`retract-${c.id}`);
+    const faultBtn = document.getElementById(`fault-${c.id}`);
     if (fireBtn) fireBtn.onclick = () => doFire(id, c.id);
     if (skipBtn) skipBtn.onclick = () => doSkip(id, c.id);
     if (retractBtn) retractBtn.onclick = () => doRetract(id, c.id);
+    if (faultBtn) faultBtn.onclick = () => doRegisterFault(id, c.label);
   });
 
   app.querySelectorAll('[data-req-act]').forEach(btn => {
@@ -553,6 +571,7 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   });
 
   drawBatchPanel(id, cues);
+  drawFaultPanel(id, cues, faultList, activeFaults, readonly);
   drawContinuePanel(id, targets || []);
 
   // 恢复焦点（轮询重绘不打断操作人/成组表单输入）
@@ -788,6 +807,155 @@ async function doBatchSubmit(perfId, cues) {
   renderPerformance(perfId);
 }
 
+/* ---------- 现场设备故障：登记 / 解除面板 ---------- */
+
+// 故障登记表单状态按演出记忆（轮询重绘不丢失正在填写的内容）
+const faultUiState = new Map();
+function getFaultState(perfId) {
+  if (!faultUiState.has(perfId)) {
+    faultUiState.set(perfId, { open: true, label: '' });
+  }
+  return faultUiState.get(perfId);
+}
+
+function drawFaultPanel(perfId, cues, faultList, activeFaults, readonly) {
+  const mount = document.getElementById('fault-panel-mount');
+  if (!mount) return;
+  const st = getFaultState(perfId);
+  const labels = cues.map(c => c.label);
+  const cueByLabel = new Map(cues.map(c => [c.label, c]));
+
+  const activeHtml = activeFaults.length === 0
+    ? '<p class="muted" style="margin:6px 0 0">当前无未解除故障。</p>'
+    : `<ul class="fault-active-list">
+        ${activeFaults.map(f => `
+          <li>
+            <span class="badge fault-badge">⚠ 未解除</span>
+            <b>${esc(f.label)}</b>
+            <span class="muted">${fmtTime(f.reported_at)} · 登记人 ${esc(f.reported_by)}：${esc(f.reason)}</span>
+            <div class="fault-affected">影响范围（沿前置关系，共 ${f.affected_labels.length} 项）：
+              ${f.affected_labels.map(l => `<span class="hint-flag flag-fault${l === f.label ? ' flag-fault-self' : ''}">${esc(l)}${l === f.label ? '（故障源）' : ''}</span>`).join('')}
+            </div>
+            <button class="danger small fault-resolve" data-fault="${f.id}" ${readonly ? 'disabled' : ''}>解除故障（记录操作人与原因）</button>
+          </li>`).join('')}
+      </ul>`;
+
+  const history = faultList.filter(f => f.status === 'resolved');
+  const historyHtml = history.length === 0 ? '' : `
+    <details class="fault-history">
+      <summary class="muted">处理记录（已解除 ${history.length} 条）</summary>
+      <ul>
+        ${history.map(f => `
+          <li>
+            <span class="badge fault-resolved-badge">已解除</span>
+            <b>${esc(f.label)}</b><br>
+            <span class="muted">
+              登记 ${fmtTime(f.reported_at)} · ${esc(f.reported_by)}：${esc(f.reason)}<br>
+              解除 ${fmtTime(f.resolved_at)} · ${esc(f.resolved_by || '-')}：${esc(f.resolve_reason || '')}
+            </span>
+          </li>`).join('')}
+      </ul>
+    </details>`;
+
+  mount.innerHTML = `
+    <div class="panel fault-panel${activeFaults.length ? '' : ' collapsed'}">
+      <div class="row">
+        <b>⚠ 现场设备故障</b>
+        <span class="muted">按提示编号登记：冻结故障提示及所有依赖它的后续提示的触发；跳过 / 撤回规则不变；不改动既有执行流水</span>
+        <span class="grow"></span>
+        <span class="muted">未解除 ${activeFaults.length}</span>
+        <button class="ghost small" id="fault-toggle">${st.open ? '收起' : '展开'}</button>
+      </div>
+      ${st.open ? `
+      ${readonly ? '<p class="muted">只读演出：故障处理记录可查，不能登记或解除。</p>' : `
+      <div class="row" style="margin-top:10px">
+        <label>故障编号
+          <input id="fault-label" type="text" list="fault-labels-${perfId}" data-focus-key="fault-${perfId}-label"
+                 value="${esc(st.label)}" placeholder="如 S1" style="width:120px">
+        </label>
+        <datalist id="fault-labels-${perfId}">
+          ${labels.map(l => `<option value="${esc(l)}"></option>`).join('')}
+        </datalist>
+        <input id="fault-reason" type="text" class="grow" data-focus-key="fault-${perfId}-reason"
+               placeholder="故障原因（必填，如：功放烧毁无输出）">
+        <button class="danger" id="fault-register">登记故障</button>
+      </div>`}
+      <div class="fault-active-wrap" style="margin-top:10px">${activeHtml}</div>
+      ${historyHtml}` : ''}
+    </div>`;
+
+  document.getElementById('fault-toggle').onclick = () => { st.open = !st.open; drawFaultPanel(perfId, cues, faultList, activeFaults); };
+  if (readonly || !st.open) return;
+
+  const labelEl = document.getElementById('fault-label');
+  const reasonEl = document.getElementById('fault-reason');
+  if (labelEl) {
+    labelEl.oninput = () => { st.label = labelEl.value; };
+  }
+  document.getElementById('fault-register').onclick = () => {
+    const label = (labelEl.value || '').trim();
+    const reason = (reasonEl.value || '').trim();
+    doRegisterFaultSubmit(perfId, label, reason, cueByLabel);
+  };
+  mount.querySelectorAll('.fault-resolve').forEach(btn => {
+    btn.onclick = () => doResolveFault(perfId, Number(btn.dataset.fault));
+  });
+}
+
+async function doRegisterFaultSubmit(perfId, label, rawReason, cueByLabel) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  if (!label) return toast('请填写故障提示编号', true);
+  if (!rawReason) return toast('登记故障必须填写原因', true);
+  const cue = cueByLabel.get(label);
+  if (!cue) return toast(`编号「${label}」不属于当前演出的执行单`, true);
+  try {
+    const r = await api(`/api/performances/${perfId}/cues/${cue.id}/faults`, {
+      method: 'POST', body: { operator, reason: rawReason },
+    });
+    getFaultState(perfId).label = '';
+    toast(`已登记「${r.fault.label}」故障，冻结 ${r.fault.affected_labels.length} 个提示的触发`);
+  } catch (e) { toast(e.message, true); }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doRegisterFault(perfId, label) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt(`登记提示「${label}」的现场设备故障，请填写故障原因（必填）：`);
+  if (reason == null) return;
+  if (!reason.trim()) return toast('登记故障必须填写原因', true);
+  const st = (await api(`/api/performances/${perfId}`).catch(() => null));
+  if (!st) return;
+  const cue = st.cues.find(c => c.label === label);
+  if (!cue) return toast(`编号「${label}」不属于当前演出的执行单`, true);
+  try {
+    const r = await api(`/api/performances/${perfId}/cues/${cue.id}/faults`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast(`已登记「${r.fault.label}」故障，冻结 ${r.fault.affected_labels.length} 个提示的触发`);
+  } catch (e) { toast(e.message, true); }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doResolveFault(perfId, faultId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt('解除故障，请填写处理情况 / 原因（必填）：');
+  if (reason == null) return;
+  if (!reason.trim()) return toast('解除故障必须填写原因', true);
+  try {
+    await api(`/api/performances/${perfId}/faults/${faultId}/resolve`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast('故障已解除，提示状态已按当前有效结果重算');
+  } catch (e) { toast(e.message, true); }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
 /* ---------- 接续关系横幅与接续面板 ---------- */
 
 function renderContinuationBanner(perf, continuation, carriedCount) {
@@ -984,12 +1152,20 @@ function cueCard(perfId, c, readonly) {
   const reviewHtml = req
     ? `<div class="cue-event"><span class="review-pending-text">待复核：${esc(req.requested_by)} 于 ${fmtTime(req.requested_at)} 申请触发，需另一操作人确认</span></div>`
     : '';
-  const canAct = !readonly && c.status === 'pending' && !req;
+  const ownFault = c.own_fault;
+  const faultSources = c.fault_blocked || [];
+  const faultHit = faultSources.length > 0;
+  const faultHtml = ownFault
+    ? `<div class="cue-event"><span class="fault-text">⚠ 本提示设备故障（${fmtTime(ownFault.reported_at)}，${esc(ownFault.reported_by)}）：${esc(ownFault.reason)}</span></div>`
+    : (faultHit
+      ? `<div class="cue-event"><span class="fault-text">⚠ 触发冻结：受故障 ${[...new Set(faultSources.map(f => '「' + f.label + '」'))].join('、')} 影响，解除前不得触发</span></div>`
+      : '');
+  const canAct = !readonly && c.status === 'pending' && !req && !faultHit;
   const done = c.status === 'fired' || c.status === 'skipped';
   const canRetract = !readonly && c.status === 'fired';
   const fireLabel = c.needs_review ? '申请触发' : '触发';
   return `
-    <div class="cue-card ${c.status}">
+    <div class="cue-card ${c.status}${faultHit ? ' fault-hit' : ''}">
       <div class="cue-seq">${c.seq}</div>
       <div class="cue-main">
         <div class="cue-title">
@@ -997,11 +1173,13 @@ function cueCard(perfId, c, readonly) {
           <span class="cue-type">${TYPE_TEXT[c.type] || c.type}</span>
           ${c.needs_review ? '<span class="badge review">双人复核</span>' : ''}
           ${c.event && c.event.source === 'carried' ? '<span class="badge carried">承接</span>' : ''}
+          ${ownFault ? '<span class="badge fault-badge">⚠ 设备故障</span>' : (faultHit ? '<span class="badge fault-affected-badge">触发冻结</span>' : '')}
           <span class="status ${c.status}">${STATUS_TEXT[c.status]}</span>
         </div>
         ${c.description ? `<div class="cue-desc">${esc(c.description)}</div>` : ''}
         <div class="cue-deps">前置：${depsHtml}</div>
         ${blockedHtml}
+        ${faultHtml}
         ${reviewHtml}
         ${eventHtml}
       </div>
@@ -1009,6 +1187,7 @@ function cueCard(perfId, c, readonly) {
         <button id="fire-${c.id}" ${canAct ? '' : 'disabled'}>${fireLabel}</button>
         <button id="skip-${c.id}" class="ghost" ${(!readonly && !done && !req) ? '' : 'disabled'}>跳过</button>
         <button id="retract-${c.id}" class="danger" ${canRetract ? '' : 'disabled'}>撤回</button>
+        <button id="fault-${c.id}" class="ghost fault-btn" ${(!readonly && !ownFault) ? '' : 'disabled'} title="登记现场设备故障">⚠ 登记故障</button>
       </div>
     </div>`;
 }

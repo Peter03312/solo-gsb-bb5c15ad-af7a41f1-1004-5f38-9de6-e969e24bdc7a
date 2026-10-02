@@ -7,7 +7,8 @@
  *   409 冲突（提示已有结果、版本已发布不可改、撤回时当前状态不允许或下游仍已触发、
  *       复核申请重复/已处置/处置人身份不符、待复核期间跳过或撤回、
  *       对只读（已接续）演出执行现场操作或接续、接续核对存在编号冲突）
- *   422 校验未通过（缺失引用/循环依赖）或前置未触发（受阻，含复核确认时前置失效）
+ *   422 校验未通过（缺失引用/循环依赖）、前置未触发（受阻，含复核确认时前置失效）
+ *       或受未解除设备故障影响（触发 / 复核确认被冻结，附 blocked_by_faults，申请保持待复核）
  */
 const { db, withTx } = require('./db');
 const { validateCues, CUE_TYPES } = require('./validate');
@@ -135,6 +136,105 @@ function firedLabelSet(versionId, latestByCue) {
       return e && e.action === 'fired';
     }).map((r) => r.label)
   );
+}
+
+/* ---- 现场设备故障：影响范围计算（沿已发布执行单的前置关系反向传播） ---- */
+
+/**
+ * 某演出当前未解除（active）的故障列表（附提示编号与序号，最新在前）。
+ * 须在事务内调用，保证与后续判定读到同一快照。
+ */
+function activeFaultRows(performanceId) {
+  return db.prepare(`
+    SELECT f.*, c.label AS label, c.seq AS seq FROM cue_faults f
+    JOIN cues c ON c.id = f.cue_id
+    WHERE f.performance_id = ? AND f.status = 'active'
+    ORDER BY f.id DESC
+  `).all(performanceId);
+}
+
+/** 该演出全部故障登记（含已解除，最新在前），附提示编号与序号 */
+function allFaultRows(performanceId) {
+  return db.prepare(`
+    SELECT f.*, c.label AS label, c.seq AS seq FROM cue_faults f
+    JOIN cues c ON c.id = f.cue_id
+    WHERE f.performance_id = ?
+    ORDER BY f.id DESC
+  `).all(performanceId);
+}
+
+/**
+ * 计算每条未解除故障的影响范围：故障提示本身 + 沿前置关系可达的全部后续提示
+ * （即直接或间接 deps 中包含故障编号的提示），按版本序号排序。
+ * 同时汇总 blockedByLabel：受影响编号 -> 阻断它的故障来源清单（label -> [fault...]）。
+ * 返回 { faults:[{...fault, affected_labels:[...]}], blockedByLabel:Map<label, [fault...]> }。
+ */
+function faultImpact(cues, activeFaults) {
+  // 前置关系反向索引：编号 -> 以它为前置的后续提示
+  const childrenOf = new Map();
+  for (const c of cues) {
+    for (const dep of c.deps) {
+      if (!childrenOf.has(dep)) childrenOf.set(dep, []);
+      childrenOf.get(dep).push(c);
+    }
+  }
+  const seqOf = new Map(cues.map((c) => [c.label, c.seq]));
+
+  const blockedByLabel = new Map();
+  const faults = activeFaults.map((f) => {
+    const affected = [];
+    const seen = new Set();
+    const queue = [f.label];
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const child of childrenOf.get(cur) || []) {
+        if (seen.has(child.label)) continue;
+        seen.add(child.label);
+        affected.push(child.label);
+        queue.push(child.label);
+      }
+    }
+    affected.sort((a, b) => (seqOf.get(a) || 0) - (seqOf.get(b) || 0) || a.localeCompare(b));
+    const affected_labels = [f.label, ...affected.filter((l) => l !== f.label)];
+    for (const l of affected_labels) {
+      if (!blockedByLabel.has(l)) blockedByLabel.set(l, []);
+      blockedByLabel.get(l).push(f);
+    }
+    return { ...f, affected_labels };
+  });
+
+  // blockedByLabel 内每条来源也保持最新登记在前
+  for (const list of blockedByLabel.values()) {
+    list.sort((a, b) => b.id - a.id);
+  }
+  return { faults, blockedByLabel };
+}
+
+/**
+ * 触发被故障阻断时的统一错误（422：前置条件当前不满足；申请保留、不改任何数据）。
+ * @param {Array} sources 阻断该提示的未解除故障（含 label / reported_by / reason）
+ */
+function faultBlockedError(sources) {
+  const detail = sources
+    .map((f) => `「${f.label}」故障（登记人 ${f.reported_by}：${f.reason}）`)
+    .join('、');
+  return new HttpError(
+    422,
+    `存在未解除的设备故障，受影响提示不得触发：${detail}。请先解除故障或改走跳过`,
+    { blocked_by_faults: sources.map(faultBrief) }
+  );
+}
+
+/** 故障在错误响应 / 列表中的精简结构 */
+function faultBrief(f) {
+  return {
+    fault_id: f.id,
+    label: f.label,
+    reported_by: f.reported_by,
+    reason: f.reason,
+    reported_at: f.reported_at,
+    ...(f.affected_labels ? { affected_labels: f.affected_labels } : {}),
+  };
 }
 
 /* ---------------- 路由表 ---------------- */
@@ -371,6 +471,25 @@ route('GET', '/api/performances/:id', (body, p) => {
   }
   for (const c of cueStates) c.pending_request = pendingByCue.get(c.id) || null;
 
+  // 现场设备故障：全部登记 / 解除记录（最新在上）+ 未解除故障沿前置关系的影响范围；
+  // 每个提示挂上 fault_blocked（被哪些未解除故障阻断，含故障编号本身）与自身故障信息
+  const impact = faultImpact(cues, activeFaultRows(perf.id));
+  const activeFaults = impact.faults;
+  const ownFaultByCue = new Map(activeFaults.map((f) => [f.cue_id, f]));
+  for (const c of cueStates) {
+    const sources = impact.blockedByLabel.get(c.label) || [];
+    c.fault_blocked = sources.map(faultBrief);
+    c.fault_blocked_labels = [...new Set(sources.map((s) => s.label))];
+    c.own_fault = ownFaultByCue.has(c.id) ? faultBrief(ownFaultByCue.get(c.id)) : null;
+  }
+  const faults = allFaultRows(perf.id).map((row) => {
+    const active = activeFaults.find((f) => f.id === row.id);
+    return {
+      ...row,
+      affected_labels: active ? active.affected_labels : [],
+    };
+  });
+
   return {
     performance: perf,
     continuation,
@@ -378,6 +497,8 @@ route('GET', '/api/performances/:id', (body, p) => {
     cues: cueStates,
     events: events.slice().reverse(),
     review_requests: reviewRequests,
+    faults,
+    active_fault_count: activeFaults.length,
   };
 });
 
@@ -399,6 +520,14 @@ function recordEvent(performanceId, cueId, action, operator, reason) {
         `该提示存在待复核的触发申请（申请人 ${pending.requested_by}，时间 ${pending.requested_at}），复核处置前不能${action === 'skipped' ? '跳过' : '触发'}`,
         { request: pending }
       );
+    }
+
+    // 未解除的设备故障：受影响提示（故障编号本身及沿前置关系依赖它的后续提示）不得触发。
+    // 跳过（skipped）不受故障影响，仍按原有规则执行。
+    if (action === 'fired') {
+      const impact = faultImpact(getVersionCues(perf.version_id), activeFaultRows(performanceId));
+      const sources = impact.blockedByLabel.get(cue.label) || [];
+      if (sources.length) throw faultBlockedError(sources);
     }
 
     if (action === 'fired') {
@@ -556,6 +685,18 @@ function confirmReviewRequest(performanceId, requestId, operator) {
     const current = latestByCue.get(req.cue_id) || null;
     if (effectiveAction(current)) throw conflictError(current);
 
+    // 未解除设备故障期间：待复核申请保留，但受影响提示不得确认（申请保持待复核，解除后可再确认）
+    const impact = faultImpact(getVersionCues(perf.version_id), activeFaultRows(performanceId));
+    const faultSources = impact.blockedByLabel.get(cue.label) || [];
+    if (faultSources.length) {
+      throw new HttpError(
+        422,
+        `该提示受未解除的设备故障影响，故障解除前不能确认触发，申请保持待复核：${
+          faultSources.map((f) => `「${f.label}」（${f.reason}）`).join('、')}`,
+        { blocked_by_faults: faultSources.map(faultBrief), request: req }
+      );
+    }
+
     // 前置失效（未触发或已撤回）时拒绝确认，申请保持待复核
     const deps = JSON.parse(cue.deps);
     if (deps.length) {
@@ -668,6 +809,106 @@ route('POST', '/api/performances/:id/cues/:cueId/retract', (body, p) => {
   const reason = String(body.reason || '').trim().slice(0, 200);
   if (!reason) throw new HttpError(400, '撤回必须填写原因');
   return retractEvent(Number(p.id), Number(p.cueId), operator, reason);
+});
+
+/* ---- 现场设备故障：登记 / 解除（与现场操作、接续同一 BEGIN IMMEDIATE 串行判定） ---- */
+
+/**
+ * 登记故障：舞台监督在当前可操作演出中按提示编号登记，填写操作人与原因。
+ *  - 编号不属于该演出使用的版本 → 404（提示须属于该演出的已发布执行单）
+ *  - 操作人 / 原因为空 → 400
+ *  - 该编号已有未解除故障 → 409（附当前故障）
+ *  - 只读（已接续）演出 → 409
+ * 登记不改写既有执行流水；返回故障记录及沿前置关系标出的影响范围。
+ */
+function registerFault(performanceId, cueId, operator, reason) {
+  return withTx(() => {
+    const { cue } = getPerfCue(performanceId, cueId);
+
+    const existing = db.prepare(
+      "SELECT * FROM cue_faults WHERE performance_id = ? AND cue_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1"
+    ).get(performanceId, cueId);
+    if (existing) {
+      throw new HttpError(
+        409,
+        `提示「${cue.label}」已有未解除故障（登记人 ${existing.reported_by}，时间 ${existing.reported_at}），请先解除后再登记`,
+        { fault: existing }
+      );
+    }
+
+    const info = db.prepare(
+      'INSERT INTO cue_faults (performance_id, cue_id, reported_by, reason) VALUES (?,?,?,?)'
+    ).run(performanceId, cueId, operator, reason);
+    const faultId = Number(info.lastInsertRowid);
+
+    // 事务内按最新状态计算影响范围（故障提示本身 + 所有依赖它的后续提示）
+    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+    const row = db.prepare(`
+      SELECT f.*, c.label AS label, c.seq AS seq FROM cue_faults f
+      JOIN cues c ON c.id = f.cue_id WHERE f.id = ?
+    `).get(faultId);
+    const { faults } = faultImpact(getVersionCues(perf.version_id), [row]);
+    return { fault: faults[0] };
+  });
+}
+
+/**
+ * 解除故障：须记录操作人与原因；该编号存在未解除故障才可解除。
+ * 解除后不写入 / 改写任何执行流水，提示状态由 GET 按当前有效结果与前置关系重算
+ * （已触发的提示维持已触发并继续满足下游前置；未执行的提示恢复 待执行 / 受阻）。
+ */
+function resolveFault(performanceId, faultId, operator, reason) {
+  return withTx(() => {
+    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+    if (!perf) throw new HttpError(404, '演出不存在');
+    assertActiveInTx(perf);
+
+    const fault = db.prepare(
+      'SELECT * FROM cue_faults WHERE id = ? AND performance_id = ?'
+    ).get(faultId, performanceId);
+    if (!fault) throw new HttpError(404, '故障记录不存在');
+    if (fault.status !== 'active') {
+      throw new HttpError(
+        409,
+        `该故障已解除（解除人 ${fault.resolved_by || '-'}，时间 ${fault.resolved_at || '-'}）`,
+        { fault }
+      );
+    }
+
+    db.prepare(`
+      UPDATE cue_faults SET status = 'resolved',
+        resolved_by = ?, resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), resolve_reason = ?
+      WHERE id = ?
+    `).run(operator, reason, fault.id);
+
+    const row = db.prepare(`
+      SELECT f.*, c.label AS label, c.seq AS seq FROM cue_faults f
+      JOIN cues c ON c.id = f.cue_id WHERE f.id = ?
+    `).get(fault.id);
+    // 解除后剩余的未解除故障及影响范围（供调用方立即按最新状态展示）
+    const { faults: remaining, blockedByLabel } = faultImpact(getVersionCues(perf.version_id), activeFaultRows(performanceId));
+    return {
+      fault: { ...row, affected_labels: [] },
+      remaining_active_faults: remaining,
+      still_blocked_labels: [...blockedByLabel.keys()],
+    };
+  });
+}
+
+route('POST', '/api/performances/:id/cues/:cueId/faults', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  if (!reason) throw new HttpError(400, '登记故障必须填写原因');
+  return registerFault(Number(p.id), Number(p.cueId), operator, reason);
+});
+
+route('POST', '/api/performances/:id/faults/:faultId/resolve', (body, p) => {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  const reason = String(body.reason || '').trim().slice(0, 200);
+  if (!reason) throw new HttpError(400, '解除故障必须填写原因');
+  return resolveFault(Number(p.id), Number(p.faultId), operator, reason);
 });
 
 /* ---- 修订执行单接续（核对 + 执行；与现场操作同一 BEGIN IMMEDIATE 串行判定） ---- */
@@ -837,6 +1078,28 @@ function buildContinuationPlan(perf, target) {
     }
   }
 
+  // 未解除设备故障：接续前必须全部解除（故障登记、解除与接续串行判定）；
+  // 防御性地覆盖整条接续链，通常只有当前可操作演出可能存在 active 故障。
+  const chainCuesByPerf = new Map(chain.map((p) => [p.id, getVersionCues(p.version_id)]));
+  const activeFaults = [];
+  for (const p of chain) {
+    const rows = activeFaultRows(p.id);
+    if (!rows.length) continue;
+    const imp = faultImpact(chainCuesByPerf.get(p.id) || [], rows);
+    for (const f of imp.faults) {
+      activeFaults.push({
+        performance_id: p.id,
+        fault_id: f.id,
+        label: f.label,
+        reported_by: f.reported_by,
+        reported_at: f.reported_at,
+        reason: f.reason,
+        affected_labels: f.affected_labels,
+      });
+      addConflict(f.label, '存在未解除的设备故障，接续前须先解除并记录操作人与原因');
+    }
+  }
+
   // 承接清单：当前演出的有效结果（fired/skipped；retracted=无有效结果，不承接）
   const latestByCue = latestEventsByCue(perf.id);
   const carried = [];
@@ -899,6 +1162,7 @@ function buildContinuationPlan(perf, target) {
     can_continue: conflicts.length === 0,
     conflicts,
     pending_requests: pendingRequests.sort((a, b) => a.label.localeCompare(b.label)),
+    active_faults: activeFaults.sort((a, b) => a.label.localeCompare(b.label)),
     hints: hintList,
     carried,
   };
@@ -936,6 +1200,7 @@ function continuePerformance(perf, target, operator, name) {
       throw new HttpError(409, '接续核对未通过，请按冲突清单处理后重试', {
         conflicts: plan.conflicts,
         pending_requests: plan.pending_requests,
+        active_faults: plan.active_faults,
       });
     }
 
@@ -1058,6 +1323,11 @@ function evaluateBatch(perf, operator, items, dryRun) {
   ).all(perf.id);
   const pendingByCue = new Map(pendingRows.map((r) => [r.cue_id, r]));
 
+  // 未解除设备故障的影响范围：成组清单不登记 / 解除故障，影响集合在整组判定中恒定，
+  // 预览与提交均以最新故障状态初始化（提交事务内重读，与单项 / 接续串行）。
+  // 跳过与撤回不受故障影响，仍按原有规则判定。
+  const faultImpactNow = faultImpact(cues, activeFaultRows(perf.id));
+
   // 前置关系反向索引（撤回时的下游保护）
   const childrenOf = new Map();
   for (const c of cues) {
@@ -1152,6 +1422,17 @@ function evaluateBatch(perf, operator, items, dryRun) {
       }
       if (cue.needs_review) {
         recordFailure(item, i, cue, 409, '该提示需双人复核，不能在成组操作中直接触发；请先在执行台发起触发申请，并由另一操作人确认');
+        return;
+      }
+      // 未解除故障阻断触发（故障编号本身及所有依赖它的后续提示）；申请—确认同样受此限
+      const faultSources = faultImpactNow.blockedByLabel.get(item.label) || [];
+      if (faultSources.length) {
+        recordFailure(
+          item, i, cue, 422,
+          `存在未解除的设备故障，受影响提示不得触发：${faultSources
+            .map((f) => `「${f.label}」故障（${f.reason}）`).join('、')}。请先解除故障或改走跳过`,
+          { blocked_by_faults: faultSources.map(faultBrief) }
+        );
         return;
       }
       const unmet = cue.deps.filter((d) => !firedLabels.has(d));

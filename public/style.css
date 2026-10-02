@@ -11,6 +11,8 @@
   --skipped: #8a8f9c;
   --blocked: #e06c75;
   --retracted: #b48dd6;
+  --fault: #ff9f43;
+  --fault-bg: #3a2a17;
 }
 * { box-sizing: border-box; }
 body {
@@ -236,3 +238,26 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .batch-preview-table tr.batch-fail { background: rgba(224, 108, 117, 0.08); }
 .batch-preview-table .fired { color: var(--fired); }
 .batch-preview-table .blocked { color: var(--blocked); display: block; }
+
+/* 现场设备故障 */
+.status.fault-active { color: var(--fault); }
+.badge.fault-badge { background: var(--fault-bg); color: var(--fault); border: 1px solid var(--fault); margin-left: 4px; }
+.badge.fault-affected-badge { background: #2e2418; color: #d8a45a; border: 1px solid #6b512c; margin-left: 4px; }
+.badge.fault-resolved-badge { background: #262a35; color: var(--muted); }
+.cue-card.fault-hit { border-left-color: var(--fault); background: #241f19; box-shadow: inset 0 0 0 1px rgba(255, 159, 67, 0.25); }
+.fault-text { color: var(--fault); font-weight: 600; }
+.fault-note-text { color: var(--fault); font-size: 12px; }
+button.fault-btn { color: var(--fault); border-color: #6b512c; margin-top: 2px; }
+
+.fault-panel { border-left: 4px solid var(--fault); margin-bottom: 16px; }
+.fault-panel.collapsed { border-left-color: var(--border); }
+.fault-active-list, .fault-history ul { padding-left: 0; margin: 0; list-style: none; }
+.fault-active-list li {
+  border: 1px solid #6b512c; border-radius: 8px; padding: 10px 12px;
+  margin: 8px 0; background: rgba(255, 159, 67, 0.06); font-size: 13px;
+}
+.fault-affected { margin: 6px 0; font-size: 12px; color: var(--muted); }
+.hint-flag.flag-fault { color: var(--fault); border-color: var(--fault); background: var(--fault-bg); }
+.hint-flag.flag-fault-self { font-weight: 700; }
+.fault-history { margin-top: 10px; font-size: 13px; }
+.fault-history li { margin: 6px 0; padding-bottom: 6px; border-bottom: 1px dashed var(--border); }
