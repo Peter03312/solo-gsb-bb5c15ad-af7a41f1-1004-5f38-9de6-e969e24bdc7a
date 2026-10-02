@@ -101,6 +101,25 @@ CREATE TABLE IF NOT EXISTS cue_review_requests (
   event_id       INTEGER REFERENCES cue_events(id)
 );
 CREATE INDEX IF NOT EXISTS idx_review_requests_perf ON cue_review_requests(performance_id, cue_id, id);
+
+-- 现场设备故障登记：独立于执行流水（登记故障不改写 cue_events）。
+-- 登记后沿已发布执行单的前置关系阻断该提示及全部下游提示的触发（含复核确认、成组触发）；
+-- 解除须记录操作人与原因，解除后提示状态仍按当前有效结果计算。
+-- 同一演出同一提示至多一条未解除故障（部分唯一索引兜底，判定在 BEGIN IMMEDIATE 事务内串行）。
+CREATE TABLE IF NOT EXISTS cue_faults (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
+  cue_id         INTEGER NOT NULL REFERENCES cues(id),
+  status         TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved')),
+  reason         TEXT NOT NULL,
+  reported_by    TEXT NOT NULL,
+  reported_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  resolved_by    TEXT,
+  resolved_at    TEXT,
+  resolve_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cue_faults_open ON cue_faults(performance_id, cue_id) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_cue_faults_perf ON cue_faults(performance_id, id);
 `);
 
 /**

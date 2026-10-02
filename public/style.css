@@ -221,6 +221,27 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 }
 .carried-text { color: #6fc6d8; font-weight: 600; }
 
+/* 现场设备故障 */
+:root { --fault: #f0883e; }
+.badge.fault { background: #3d2a17; color: var(--fault); margin-left: 4px; }
+.badge.fault-resolved { background: #14342a; color: var(--fired); }
+.status.fault-open { color: var(--fault); }
+.fault-text { color: var(--fault); font-weight: 600; }
+.cue-card.fault-blocked { border-left-color: var(--fault); background: linear-gradient(0deg, rgba(240,136,62,.06), rgba(240,136,62,.06)), var(--panel); }
+.fault-panel { border-left: 4px solid var(--fault); margin-bottom: 16px; }
+.fault-panel.quiet { border-left-color: var(--border); }
+.fault-panel input { font-size: 13px; }
+.fault-list { margin-top: 10px; }
+.fault-item {
+  border: 1px solid var(--border); border-left: 3px solid var(--fault);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; font-size: 13px;
+}
+.fault-affected { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.fault-history { margin-top: 8px; font-size: 13px; }
+.fault-history ul { padding-left: 0; margin: 8px 0 0; }
+.fault-history li { list-style: none; margin: 8px 0; border-bottom: 1px dashed var(--border); padding-bottom: 8px; }
+.fault-history li:last-child { border-bottom: none; padding-bottom: 0; }
+
 /* 成组连续处置 */
 .batch-panel { border-left: 4px solid var(--accent); margin-bottom: 16px; }
 .batch-panel.collapsed { border-left-color: var(--border); }

@@ -424,7 +424,7 @@ async function renderPerformance(id) {
   } catch (e) { app.innerHTML = `<div class="error-list">${esc(e.message)}</div>`; }
 }
 
-function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests }) {
+function drawPerformance(id, { performance: perf, continuation, continue_targets: targets, cues, events, review_requests: reviewRequests, faults }) {
   // 2.5s 轮询整体重绘：记住当前焦点与光标位置，重绘后恢复，避免输入被打断
   const active = document.activeElement;
   const focusKey = active && (active.dataset.focusKey || (active.id === 'operator-input' ? 'operator' : null));
@@ -439,6 +439,8 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   const resolvedReqs = requests.filter(r => r.status !== 'pending');
   const readonly = !!(continuation && continuation.readonly);
   const carriedCount = events.filter(e => e.source === 'carried').length;
+  const faultList = faults || [];
+  const openFaults = faultList.filter(f => f.status === 'open');
 
   // 正在操作人框中输入时保留 DOM 中的实时值（下方 innerHTML 重绘前取出），避免光标跳尾
   const opFocused = focusKey === 'operator';
@@ -462,12 +464,14 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
         <span class="status skipped">已跳过 ${counts.skipped}</span>
         <span class="status blocked">受阻 ${counts.blocked}</span>
         ${pendingReqs.length ? `<span class="status review-pending">待复核 ${pendingReqs.length}</span>` : ''}
+        ${openFaults.length ? `<span class="status fault-open">⚠ 故障 ${openFaults.length}</span>` : ''}
         <span class="grow"></span>
         <label>操作人 <input id="operator-input" type="text" value="${esc(opVal)}" placeholder="姓名" style="width:110px" ${readonly ? 'disabled' : ''}></label>
         <a href="#/shows/${perf.show_id}">返回场次</a>
       </div>
     </div>
     ${renderContinuationBanner(perf, continuation, carriedCount)}
+    <div id="fault-panel-mount"></div>
     ${readonly ? '' : '<div id="batch-panel-mount"></div>'}
     ${readonly ? '' : '<div id="continue-panel-mount"></div>'}
     <div class="grid-2">
@@ -531,6 +535,9 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
   const opInput = document.getElementById('operator-input');
   if (opInput) opInput.onchange = opInput.oninput = () => localStorage.setItem('operator', opInput.value.trim());
 
+  // 故障面板只读演出同样渲染（展示影响范围与处理记录，无操作按钮）
+  drawFaultPanel(id, cues, faultList, readonly);
+
   if (readonly) return;
 
   cues.forEach(c => {
@@ -567,6 +574,126 @@ function drawPerformance(id, { performance: perf, continuation, continue_targets
       }
     }
   }
+}
+
+/* ---------- 现场设备故障面板 ---------- */
+
+// 故障面板表单状态按演出记忆（2.5s 轮询重绘时保留正在填写的编号与原因）
+const faultUiState = new Map();
+function getFaultState(perfId) {
+  if (!faultUiState.has(perfId)) faultUiState.set(perfId, { label: '', reason: '' });
+  return faultUiState.get(perfId);
+}
+
+function drawFaultPanel(perfId, cues, faults, readonly) {
+  const mount = document.getElementById('fault-panel-mount');
+  if (!mount) return;
+  const st = getFaultState(perfId);
+  const open = faults.filter(f => f.status === 'open');
+  const resolved = faults.filter(f => f.status !== 'open');
+  // 影响范围：被该故障编号阻断的全部提示（故障提示自身 + 沿前置关系的下游）
+  const affectedBy = (label) => cues.filter(c => c.fault && c.fault.sources.includes(label)).map(c => c.label);
+
+  mount.innerHTML = `
+    <div class="panel fault-panel${open.length ? '' : ' quiet'}">
+      <div class="row">
+        <b>⚠ 现场设备故障</b>
+        <span class="muted">按提示编号登记故障；未解除期间该提示及所有依赖它的后续提示不得触发（跳过 / 撤回不受影响）</span>
+      </div>
+      ${readonly ? '' : `
+      <div class="row" style="margin-top:10px">
+        <input id="fault-label" type="text" list="fault-cue-labels-${perfId}" data-focus-key="fault-${perfId}-label"
+               value="${esc(st.label)}" placeholder="故障提示编号，如 S1" style="width:150px">
+        <datalist id="fault-cue-labels-${perfId}">
+          ${cues.map(c => `<option value="${esc(c.label)}"></option>`).join('')}
+        </datalist>
+        <input id="fault-reason" type="text" class="grow" data-focus-key="fault-${perfId}-reason"
+               value="${esc(st.reason)}" placeholder="故障原因（必填，如：调音台无输出）">
+        <button id="fault-report">登记故障</button>
+      </div>`}
+      ${open.length === 0
+        ? `<p class="muted" style="margin:10px 0 0">${readonly && faults.length === 0 ? '无故障记录。' : '当前无未解除故障。'}</p>`
+        : `
+        <div class="fault-list">
+          ${open.map(f => `
+            <div class="fault-item">
+              <div class="row" style="gap:8px">
+                <span class="badge fault">未解除</span>
+                <b>${esc(f.label)}</b>
+                <span class="muted">${esc(f.reported_by)} 登记于 ${fmtTime(f.reported_at)}</span>
+                <span class="grow"></span>
+                ${readonly ? '' : `<button class="small" data-fault-resolve="${f.id}">解除故障</button>`}
+              </div>
+              <div class="muted" style="margin-top:4px">原因：${esc(f.reason)}</div>
+              <div class="fault-affected">影响范围（解除前不可触发）：${affectedBy(f.label).map(l => `<span class="dep-chip unmet-chip">${esc(l)}</span>`).join('')}</div>
+            </div>`).join('')}
+        </div>`}
+      ${resolved.length === 0 ? '' : `
+        <details class="fault-history">
+          <summary class="muted">处理记录（已解除 ${resolved.length}）</summary>
+          <ul>
+            ${resolved.map(f => `
+              <li>
+                <span class="badge fault-resolved">已解除</span>
+                <b>${esc(f.label)}</b>
+                <span class="muted">　故障：${esc(f.reason)}（${esc(f.reported_by)} · ${fmtTime(f.reported_at)}）<br>
+                　解除：${esc(f.resolve_reason || '-')}（${esc(f.resolved_by || '-')} · ${fmtTime(f.resolved_at)}）</span>
+              </li>`).join('')}
+          </ul>
+        </details>`}
+    </div>`;
+
+  if (readonly) return;
+  const labelEl = document.getElementById('fault-label');
+  const reasonEl = document.getElementById('fault-reason');
+  labelEl.oninput = () => { st.label = labelEl.value; };
+  reasonEl.oninput = () => { st.reason = reasonEl.value; };
+  document.getElementById('fault-report').onclick = () => doReportFault(perfId);
+  mount.querySelectorAll('[data-fault-resolve]').forEach(btn => {
+    btn.onclick = () => doResolveFault(perfId, btn.dataset.faultResolve);
+  });
+}
+
+async function doReportFault(perfId) {
+  const st = getFaultState(perfId);
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  const label = (document.getElementById('fault-label').value || '').trim();
+  const reason = (document.getElementById('fault-reason').value || '').trim();
+  st.label = label; st.reason = reason;
+  if (!label) return toast('请填写故障提示编号', true);
+  if (!reason) return toast('登记故障必须填写原因', true);
+  try {
+    const r = await api(`/api/performances/${perfId}/faults`, {
+      method: 'POST', body: { label, operator, reason },
+    });
+    st.label = ''; st.reason = '';
+    toast(`已登记故障：${r.fault.label}，受影响提示 ${r.affected.length} 条（${r.affected.join('、')}）解除前不可触发`);
+  } catch (e) {
+    // 400 信息为空 / 404 编号不属于该演出 / 409 已有未解除故障
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
+}
+
+async function doResolveFault(perfId, faultId) {
+  const operator = getOperator();
+  if (!operator) { toast('请先填写操作人（顶部操作人输入框）', true); return document.getElementById('operator-input').focus(); }
+  const reason = window.prompt('请填写解除原因（必填，如：设备已更换并复测正常）：');
+  if (reason == null) return;
+  if (!reason.trim()) return toast('解除故障必须填写原因', true);
+  try {
+    await api(`/api/performances/${perfId}/faults/${faultId}/resolve`, {
+      method: 'POST', body: { operator, reason: reason.trim() },
+    });
+    toast('故障已解除，受影响提示按当前有效结果恢复判定');
+  } catch (e) {
+    // 409 已解除 / 只读演出
+    toast(e.message, true);
+  }
+  stopPolling();
+  renderPerformance(perfId);
 }
 
 /* ---------- 现场成组处置面板 ---------- */
@@ -984,12 +1111,18 @@ function cueCard(perfId, c, readonly) {
   const reviewHtml = req
     ? `<div class="cue-event"><span class="review-pending-text">待复核：${esc(req.requested_by)} 于 ${fmtTime(req.requested_at)} 申请触发，需另一操作人确认</span></div>`
     : '';
-  const canAct = !readonly && c.status === 'pending' && !req;
+  const fault = c.fault;
+  const faultHtml = fault
+    ? `<div class="cue-event"><span class="fault-text">⚠ ${fault.own
+        ? `设备故障：${esc(fault.own.reason)}（${esc(fault.own.reported_by)} 登记于 ${fmtTime(fault.own.reported_at)}）`
+        : `受故障影响（故障编号：${fault.sources.map(esc).join('、')}）`}，解除前不可触发</span></div>`
+    : '';
+  const canAct = !readonly && c.status === 'pending' && !req && !fault;
   const done = c.status === 'fired' || c.status === 'skipped';
   const canRetract = !readonly && c.status === 'fired';
   const fireLabel = c.needs_review ? '申请触发' : '触发';
   return `
-    <div class="cue-card ${c.status}">
+    <div class="cue-card ${c.status}${fault ? ' fault-blocked' : ''}">
       <div class="cue-seq">${c.seq}</div>
       <div class="cue-main">
         <div class="cue-title">
@@ -997,11 +1130,13 @@ function cueCard(perfId, c, readonly) {
           <span class="cue-type">${TYPE_TEXT[c.type] || c.type}</span>
           ${c.needs_review ? '<span class="badge review">双人复核</span>' : ''}
           ${c.event && c.event.source === 'carried' ? '<span class="badge carried">承接</span>' : ''}
+          ${fault ? '<span class="badge fault">故障阻断</span>' : ''}
           <span class="status ${c.status}">${STATUS_TEXT[c.status]}</span>
         </div>
         ${c.description ? `<div class="cue-desc">${esc(c.description)}</div>` : ''}
         <div class="cue-deps">前置：${depsHtml}</div>
         ${blockedHtml}
+        ${faultHtml}
         ${reviewHtml}
         ${eventHtml}
       </div>
